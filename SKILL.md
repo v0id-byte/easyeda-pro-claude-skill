@@ -1,200 +1,189 @@
 ---
 name: easyeda-pro
-description: Edit, fix, audit, or reverse-engineer schematics in EasyEDA Pro / LCEDA Pro / JLCEDA / 嘉立创EDA专业版 (立创EDA) by driving the desktop app with computer-use and verifying every change against the exported netlist instead of the canvas. Use when the user wants to modify a schematic, fix circuit or connectivity defects, rename nets, connect floating/unconnected pins, add / move / delete / replace components, swap a chip part variant, wire SPI/power/ground, ground a thermal pad, or check a design's connectivity in EasyEDA Pro / LCEDA Pro / 嘉立创EDA / JLCEDA / EasyEDA. Encodes the per-pin net-port connectivity model, the delete-no-connect-flag → place-net-port → draw-wire workflow, Allegro .tel netlist export + grep/diff verification, the .eprj2/.epro2 file formats, computer-use automation patterns and macOS gotchas (stuck placement tools, occlusion render-freeze, 900s idle-timeout connector drops), and the "hand the user a precise change-list and verify their work via the netlist" division of labor.
-version: 1.0.0
+description: Edit, fix, audit, or reverse-engineer schematics in EasyEDA Pro / LCEDA Pro / JLCEDA / 嘉立创EDA专业版 (立创EDA) — driving it through the official Extension API & WebSocket bridge, a third-party MCP server, or computer-use as a GUI fallback — and verifying every change against the exported netlist instead of the canvas. Use when the user wants to modify a schematic, fix circuit/connectivity defects, rename nets, connect floating/unconnected pins, add / move / delete / replace components, swap a chip part variant, wire SPI/power/ground, ground a thermal pad, or check a design's connectivity in EasyEDA Pro / LCEDA Pro / 嘉立创EDA / JLCEDA / EasyEDA. Encodes the netlist-first verification discipline (works no matter how you edit), the per-pin net-port connectivity model, the official API / MCP options (easyeda-api-skill, pro-api-sdk, jlcmcp, EasyEDA Pro MCP), the delete-no-connect-flag → place-net-port → draw-wire GUI workflow, Allegro .tel netlist export + grep/diff recipes, the .eprj2/.epro2 file formats, computer-use gotchas (stuck tools, occlusion freeze, 900s idle-timeout connector drops), and the "hand the user a precise change-list and verify via netlist" division of labor.
+version: 1.1.0
 ---
 
 # EasyEDA Pro / LCEDA Pro / 嘉立创EDA专业版 — schematic editing & netlist-verified fixes
 
-This skill is for editing and fixing **schematics** in EasyEDA Pro (international name) =
-LCEDA Pro = JLCEDA = **嘉立创EDA专业版** (立创EDA专业版) — JLCPCB's pro EDA tool. The app has
-**no public API and no MCP**, so you drive its GUI with **computer-use**. The whole approach is
-built around one idea that makes GUI automation reliable:
+For editing, fixing, and auditing **schematics** in EasyEDA Pro (international name) =
+LCEDA Pro = JLCEDA = **嘉立创EDA专业版** (立创EDA专业版) — JLCPCB's pro EDA tool.
 
-## 0. Prime directive: verify with the NETLIST, not your eyes
+You can drive it **programmatically** (official Extension API / WebSocket bridge, or a third-party
+MCP server) or, as a fallback, by **computer-use** on the GUI. Whatever the editing channel, the one
+discipline that makes AI-driven schematic work reliable is the same:
 
-The canvas lies. A net port that visually touches a pin can have a one-pixel gap and **not be
-connected**. A wire can look fine and be on the wrong net. So:
+## 0. Prime directive: verify with the NETLIST, not your eyes (or the API's "OK")
 
-> **After every change, export the netlist and check connectivity in the exported text file —
-> never trust the screenshot.**
+A change that *looks* applied — on the canvas, or in a successful API call — can still be wrong: a net
+port one pixel off a pin doesn't connect; an API edit can land on the wrong net; a part swap silently
+remaps pin functions. So, regardless of how you edit:
 
-The netlist is the single source of truth. This catches the failures the eye misses:
-- **Virtual connections** — a port/wire that looks attached but isn't (the pin is simply absent
+> **After every change, export the netlist and check connectivity in the exported text — never trust
+> the screenshot or a bare "success".**
+
+The netlist is the single source of truth. It catches the failures everything else hides:
+- **Virtual connections** — a port/wire/edit that looks attached but isn't (the pin is simply absent
   from the net).
-- **Silent net merges** — e.g. importing an edited project once collapsed three separate 5 V rails
-  (`5V_A`/`5V_B`/`5V_SYS`) into one 71-pin net. Invisible on the canvas, obvious in the netlist.
-- **Part-swap pin remaps** — replacing a chip with a pin-compatible variant keeps pin *numbers* but
-  changes pin *functions*; the netlist (which is pin-number based) shows whether you wired the new
-  function.
+- **Silent net merges** — e.g. one bad import collapsed three separate 5 V rails
+  (`5V_A`/`5V_B`/`5V_SYS`) into a single 71-pin net. Invisible on the canvas, obvious in the netlist.
+- **Part-swap pin remaps** — a pin-compatible variant keeps pin *numbers* but changes pin *functions*;
+  the netlist (pin-number based) shows whether you wired the new function.
 
-Workflow shape for any task:
-1. Open the project. **Export a baseline netlist** and read it — that's ground truth for "before".
-2. Make a small, scoped change in the GUI.
+Workflow shape for any task, any channel:
+1. Open the project. **Export a baseline netlist** and read it — ground truth for "before".
+2. Make a small, scoped change.
 3. **Re-export the netlist**, grep/diff the affected nets/pins against what you intended.
 4. Only move on once the netlist confirms it. Repeat.
 
-## 1. Mental model: per-pin **net ports** define connectivity
+## 1. Editing channels — prefer the API/MCP; computer-use is the fallback
+
+EasyEDA Pro **does** have programmatic access (this surprises people — there's no REST API, but there
+is an in-app JS Extension API reachable over a local WebSocket bridge). Prefer it:
+
+- **Official Extension API + WebSocket bridge** — the most authoritative path.
+  - [`easyeda/easyeda-api-skill`](https://github.com/easyeda/easyeda-api-skill) — EasyEDA's *own* AI
+    skill: load the `run-api-gateway.eext` extension, it starts a local bridge on ports
+    **49620–49629**, then run any EasyEDA Pro JS API call via `curl -X POST localhost:49620/execute -d
+    '{"code":"..."}'`. Works with Claude / the Agent Skills standard.
+  - [`easyeda/pro-api-sdk`](https://github.com/easyeda/pro-api-sdk) + docs at
+    `prodocs.easyeda.com/en/api/` — the full Extension API surface (project, schematic, PCB,
+    components, DRC, export).
+- **Third-party MCP servers** (stdio MCP → WebSocket gateway → in-app bridge extension):
+  - [`hyl64/jlcmcp`](https://github.com/hyl64/jlcmcp) — ~39 tools incl. **read schematic, export
+    netlist, schematic DRC**, component move/place, routing, copper, impedance calc.
+  - [`QuincySx/easyeda-pro`](https://www.pulsemcp.com/servers/quincysx-easyeda-pro) — ~72 tools,
+    schematic→PCB→manufacturing.
+  - [`sengbin/JLCEDA-MCP`](https://github.com/sengbin/JLCEDA-MCP),
+    [`txwilliam/LCEDApro-mcp-extension`](https://github.com/txwilliam/LCEDApro-mcp-extension).
+- **EasyEDA's in-app AI assistant** also ships an MCP build (real-time schematic refresh/review).
+
+Use **computer-use** (sections 5–6) only when the bridge/MCP isn't set up, for a quick one-off, or for
+cross-app workflows. It's slow and brittle (see the gotchas) — set up the API/MCP for anything beyond
+a few edits.
+
+> Reality check: these channels let you *make* changes faster, but none of them *verify* connectivity
+> for you. Section 0 still applies. The unique value of this skill is the verification discipline +
+> mental model + fallback playbook below — it sits on top of whatever channel you use.
+
+## 2. Mental model: per-pin **net ports** define connectivity
 
 In EasyEDA Pro schematics, nets are usually defined by **per-pin net ports / net labels**
-(网络端口 / 网络标签) — the little flags carrying a net name next to each pin — **not** by long
-drawn wires. Two pins are on the same net because their ports share the same **name**.
+(网络端口 / 网络标签) — the flags carrying a net name next to each pin — **not** by long drawn wires.
+Two pins share a net because their ports share the same **name**.
 
-Consequences:
-- **Renaming a net = renaming net ports.** Changing one port's name moves *only that pin* to the new
-  net. To rename a whole net you must rename **every** port carrying the old name, or the net splits.
-- **Moving a pin to another net = renaming its port** (e.g. move a decoupling cap's hot pin from
-  `24V_BUS` to `VM` by renaming its port).
-- **Connecting a floating pin = adding a port** (and removing any no-connect flag first).
+Consequences (true for API edits and GUI edits alike):
+- **Renaming a net = renaming net ports.** Changing one port's name moves *only that pin*. To rename a
+  whole net you must change **every** port on it, or the net splits.
+- **Moving a pin to another net = renaming its port** (e.g. move a cap's hot pin from `24V_BUS` to `VM`).
+- **Connecting a floating pin = adding a port** (after removing any no-connect flag).
 - A net's true membership is whatever the netlist says — always re-derive it from the export.
 
-## 2. File formats (so you know what's editable)
+## 3. File formats (so you know what's editable)
 
 | File | What it is | Editable? |
 |---|---|---|
-| `*.eprj2` | The project. **SQLite**; schematic data is an **encrypted blob** in `history_data`. | **No** — can't read/script it directly. Edit via the GUI. |
-| `*.epro2` | An **export** of the project. It's a **zip**; inside, the `.epru` is a **plaintext** record stream (`head\|\|body\|`, `\n`-separated). | Parseable/scriptable, round-trips losslessly. **But re-importing it can silently merge nets** — verify hard afterward, or avoid the import path. |
-| `*.tel` | A **netlist** export (Allegro Telesis format). Plaintext, lists every net and its pins. | **Read-only ground truth.** This is your verification oracle. |
+| `*.eprj2` | The project. **SQLite**; schematic data is an **encrypted blob** in `history_data`. | Not directly — edit via the API/MCP or GUI. |
+| `*.epro2` | An **export** of the project. A **zip**; inside, the `.epru` is **plaintext** (`head\|\|body\|`, `\n`-separated), round-trips losslessly. | Scriptable, **but re-importing can silently merge nets** — verify hard, or avoid the import path. |
+| `*.tel` | A **netlist** export (Allegro Telesis format). Plaintext, lists every net and its pins. | **Read-only ground truth — your verification oracle.** |
 
-⚠️ Components can share an `id` **across pages**; if you ever parse the `.epru`, index **per page
-range** (`SCH_PAGE`), not globally.
+⚠️ Component `id`s can repeat **across pages**; if you parse `.epru`, index **per page** (`SCH_PAGE`).
 
-## 3. Operation recipes (GUI)
+## 4. Operation goals (express via API, MCP, or GUI)
 
-Menu names are given in English (中文) for the localized UI. Adjust to the user's language.
+These are the connectivity goals; achieve them through whichever channel, then verify in the netlist.
 
-### Export the netlist (your verification step — do it constantly)
-`Export → Netlist` (导出 → 网表文件) → type **Allegro(.tel)** → `Export` (导出) → save to disk
-(Desktop is convenient). Then read it with the Read tool / shell. Give each export a distinct name
-(`Netlist_after_C6.tel`, …) so you can diff against earlier states; **don't overwrite your baseline.**
+- **Rename a net / move a pin to another net** — change the pin's net-port name to the target net.
+- **Connect a floating pin to a net** — remove its no-connect flag, then give the pin a port on the
+  target net.
+- **Add / delete / move a component**; **change a value**; **replace / swap a part variant** ⚠️ — after
+  a swap, pin *numbers* stay but pin *functions* change (e.g. a motor driver's pins 33–36 go from
+  `MODE/SLEW/OCP/GAIN` on the hardware variant to `SDO/SDI/SCLK/nSCS` on the SPI variant). Re-wire by the
+  **new** function and verify the netlist pin assignments.
+- **Export the netlist** for verification (Allegro `.tel`).
 
-### Rename a net / move a pin to another net
-1. Click the pin's **net port** to select it.
-2. In the **Properties** panel → **名称 (Name)** field → type the new net name → Enter.
-3. This changes **only that port**. Repeat for every port that must move.
-4. **Verify**: re-export, grep the old and new net — confirm the right pins moved and none were left behind.
+## 5. Fallback channel — driving the GUI with computer-use
 
-### Connect a floating / unconnected pin to a net (the robust method)
-A floating pin often carries a **no-connect flag** (非连接标识, the green ✗). You must delete it first.
-1. **Delete the no-connect flag**: click it → `Del`.
-2. **Place a net port**: `Place → Net Port` (放置 → 网络端口, the "input" pentagon). Single-click to
-   drop one *next to* the pin.
-3. **Name it**: double-click / select the port → Properties → **名称** → set to the target net
-   (`GND`, `AVDD`, `3V3`, …).
-4. **Wire it**: `Place → Wire` (放置 → 导线), draw from the **pin endpoint** to the **port's
-   connection point**.
-5. **`Esc`** to exit the tool (if `Esc` doesn't take, **right-click** to cancel — see gotchas).
-6. **Verify**: re-export; confirm the pin (`U10.26`, …) now appears in the target net.
+When you must use the GUI. Menu names in English (中文).
 
-> A quicker variant is `Place → Net Label` (网络标签) dropped directly on the pin endpoint, then
-> rename. It works but the tool is twitchy (see gotchas), and on right-hand-side pins a stray click
-> can start a long free wire. The port+wire method above is the safe default.
+- **Export netlist**: `Export → Netlist` (导出 → 网表文件) → **Allegro(.tel)** → save to disk. Give each
+  export a distinct name; don't overwrite your baseline.
+- **Rename a net / move a pin**: click the pin's net port → Properties → **名称 (Name)** → type the new
+  net → Enter. Changes only that port; repeat for every port that must move. Then re-export & verify.
+- **Connect a floating pin** (robust recipe):
+  1. Delete the **no-connect flag** (非连接标识, green ✗): click it → `Del`.
+  2. `Place → Net Port` (放置 → 网络端口, the "input" pentagon): single-click *next to* the pin.
+  3. Name it: select → Properties → **名称** → target net (`GND`/`AVDD`/`3V3`…).
+  4. `Place → Wire` (放置 → 导线): draw from the **pin endpoint** to the **port's connection point**.
+  5. `Esc` (if it won't exit, **right-click** to cancel — see gotchas). Re-export & verify.
+- **Add a component**: `Place → Component` (放置 → 器件, Shift+F) → search part → place → wire.
+- **Batch the select→edit cycle** in one `computer_batch`: `left_click(port)` →
+  `triple_click(Properties 名称 field)` → `type(name)` → `key(Return)`; chain several pins per batch.
+- **Zoom before clicking tiny targets**; **cross-probe** via the Networks panel (网络) to jump to a pin;
+  **save** (`Cmd/Ctrl+S`) before exporting.
 
-### Add a component
-`Place → Component` (放置 → 器件, Shift+F) → search the part number → place → wire it / add ports.
+## 6. computer-use gotchas (macOS — hard-won)
 
-### Replace / swap a part variant ⚠️
-Select the component → right-click / Properties → **Replace** (替换器件) → search the new part.
-**Pin numbers stay; pin functions can change.** Example: a motor driver's pins 33–36 were
-`MODE/SLEW/OCP/GAIN` on the hardware variant and become `SDO/SDI/SCLK/nSCS` on the SPI variant — same
-numbers, different meaning. After swapping, **re-wire by the new function** and **verify the netlist
-pin assignments** (e.g. SPI_MISO must include the SDO pin number, not the old GAIN pin).
-
-### Delete / move / rotate
-Delete: select → `Del`. Move a value: double-click → edit **值 (Value)**. Rotate/mirror: select →
-Space / right-click.
-
-## 4. Driving the app with computer-use (automation patterns)
-
-- **Batch the select→edit cycle.** The fastest reliable rename is, in one `computer_batch`:
-  `left_click(netport)` → `triple_click(Properties 名称 field)` → `type(newname)` → `key(Return)`.
-  Chain several pins in a single batch (coordinates all refer to the pre-batch screenshot).
-- **Zoom before clicking small targets.** Net-port labels are tiny; use the read-only `zoom` to read
-  exact pixel coordinates, then click. Pins ~10–12 px apart are doable but verify with the netlist.
-- **Cross-probe to navigate.** Double-clicking a pin entry in the **Networks** panel (网络) jumps the
-  canvas to that port and zooms in — handy for finding a specific pin on a big sheet.
-- **The Networks panel has no rename.** Right-click there only offers expand/highlight; rename is
-  done on the canvas via the port's Properties.
-- **Save before exporting** (`Cmd/Ctrl+S`); the export reflects saved state.
-
-## 5. computer-use gotchas (macOS — hard-won)
-
-- **Placement tools get STUCK active.** After `Place → Net Label/Wire`, the tool often **does not exit
-  on `Esc`** — and then **every subsequent click places another element** (you'll see NET1, NET2, …
-  pile up and stray wires grow). Fix: **right-click to cancel** the placement, *then* the tool is off
-  and `Cmd+Z` works again. When in doubt, right-click first, verify the tool is off (move the mouse —
-  no preview line follows), then act.
-- **`Cmd+Z` goes to whatever has focus.** If the left-panel search box has focus, undo edits the
-  search text, not the schematic. Click an empty canvas spot to focus the canvas first — but only
-  when no placement tool is active (else the click places something).
-- **Copy-paste of a net port can spawn junk** (once produced a stray capacitor). Prefer the explicit
-  place-port + wire recipe over paste.
-- **Occlusion render-freeze (the UI looks dead).** If the Claude desktop app's window is fully
-  covered by the target app, macOS marks it occluded and Chromium suspends painting — the user sees a
-  stale frame and can't read/reply, though injected input still works. Mitigate: a **second display**
-  (target app on one, Claude on the other) eliminates it; otherwise tile so a sliver of Claude stays
-  visible; never run the target app in true-fullscreen. (Launching the app with
+- **Placement tools get STUCK active.** After `Place → Net Label/Wire`, the tool often **won't exit on
+  `Esc`**, and then **every click places another element** (NET1, NET2, … pile up; stray wires grow).
+  Fix: **right-click to cancel**, *then* the tool is off and `Cmd+Z` works.
+- **`Cmd+Z` follows focus.** If the panel search box has focus, undo edits the search text, not the
+  schematic. Click an empty canvas spot to focus first — but only when no placement tool is active.
+- **Copy-paste of a net port can spawn junk** (once produced a stray capacitor). Prefer place-port+wire.
+- **Occlusion render-freeze.** If the agent's window is fully covered, macOS suspends its painting —
+  stale frame, can't read/reply, though input still works. Use a **second display**, or tile so a sliver
+  stays visible; never run the target app in true-fullscreen. (Launch flags
   `--disable-renderer-backgrounding --disable-backgrounding-occluded-windows
-  --disable-background-timer-throttling` is the deeper fix.)
-- **The connector drops after ~15 min idle.** The desktop app's IdleManager disconnects a local
-  session after ~900 s idle and tears down computer-use **without auto-reconnect**. Symptom mid-task:
-  `ToolSearch "computer-use"` returns nothing. It's independent of the render flags. Mitigation: work
-  in **continuous bursts** (no long pauses), and after any lull **re-verify the connector is alive
-  before acting**. This idle drop is the single biggest reason to prefer the hand-off pattern below
-  for long jobs.
-- **Frontmost-app gate.** If a non-allowlisted app (a browser, etc.) is frontmost, clicks on the EDA
-  are rejected. Bring the EDA forward with `open_application` and retry (often the 2nd attempt passes).
+  --disable-background-timer-throttling` are the deeper fix.)
+- **Connector drops after ~15 min idle.** The desktop app's IdleManager tears down computer-use after
+  ~900 s idle with no auto-reconnect (`ToolSearch "computer-use"` returns nothing mid-task). Work in
+  continuous bursts; re-verify the connector after any lull. This idle drop is a big reason to prefer
+  the API/MCP, or the hand-off pattern below, for long jobs.
+- **Frontmost-app gate.** If a non-allowlisted app is frontmost, clicks are rejected; bring the EDA
+  forward (`open_application`) and retry.
 
-## 6. When pixel-automation is too slow: hand off + verify
+## 7. When automation is slow/flaky: hand off + verify
 
-Dozens of component placements and pin-by-pin wires over a flaky connector is the *wrong* tool. The
-**high-leverage division of labor** that actually ships:
+If the API/MCP isn't set up and the GUI work is dozens of placements over a flaky connector, the
+high-leverage split is:
+- **You** produce a precise, netlist-grounded **change list** — per sheet, each item
+  `[location] current → target + exact action`, with done-markers and a how-to cheat sheet.
+- **The user** (fast in the EDA) executes it.
+- **They export a netlist per page and send it; you verify it to the net** — every intended connection
+  present, no shorts, no typos, no virtual connections — and point to the exact pin/net to fix.
 
-- **You** produce a precise, netlist-grounded **change list** — per sheet, each item as
-  `[location] current → target + the exact GUI action`, with done-markers and a how-to cheat sheet.
-- **The user** (fast and fluent in the EDA) executes it.
-- **They export a netlist per page and send it to you; you verify it to the net** — confirm each
-  intended connection exists, no shorts, no typos, no virtual connections — and point to the exact
-  pin/net to fix.
+The human is faster at GUI manipulation; you are better at exhaustive, exact connectivity checking.
 
-This plays to both strengths: the human is far faster at GUI manipulation; you are far better at
-exhaustive, exact connectivity checking. Offer this split as soon as the work turns into many
-component placements.
+## 8. Netlist verification recipes (shell)
 
-## 7. Netlist verification recipes (shell)
-
-The `.tel` is Allegro Telesis: a `$PACKAGES` block (`footprint ! footprint ! value ; REFDES…`) then
-a `$NETS` block (`'NETNAME' ; refdes.pin refdes.pin …`), with indented continuation lines for long
-nets. Useful checks:
+The `.tel` is Allegro Telesis: a `$PACKAGES` block (`footprint ! footprint ! value ; REFDES…`) then a
+`$NETS` block (`'NETNAME' ; refdes.pin refdes.pin …`), with indented continuation lines.
 
 ```bash
-# Which net is a given pin on? (and is it where you intended?)
-grep -nE "U10\.26( |$)" netlist.tel          # pin 26 of U10 — appears in which net's line?
+# Which net is a pin on, and is it where you intended?
+grep -nE "U10\.26( |$)" netlist.tel
 
 # Full membership of a net (handles multi-line continuations):
 awk '/^.?GND.? ;/{p=1} p{print} p&&/^[^ '\'']/&&!/GND ;/{exit}' netlist.tel \
-  | grep -oE "U10\.[0-9]+" | sort -t. -k2 -n      # all U10 pins on GND, sorted
+  | grep -oE "U10\.[0-9]+" | sort -t. -k2 -n
 
-# Did a part-swap wire the SPI correctly? (pin numbers, by net)
+# Did a part-swap wire SPI correctly? (pin numbers, by net)
 grep -E "^'SPI_(MISO|MOSI|SCLK|CS_DRV)'" netlist.tel
 
 # Are rails still separate (no silent merge)?
 grep -E "^'?5V_(A|B|SYS)'? ;" netlist.tel        # expect three distinct lines
 
-# Any stray auto-named nets left from a botched placement?
+# Any stray auto-named nets from a botched placement?
 grep -nE "^'?NET[0-9]+'? ;" netlist.tel || echo "clean"
-
-# A pin that's NOT in any net = floating (virtual connection / forgotten):
-grep -oE "U10\.[0-9]+" netlist.tel | sort -u     # compare against the chip's pin list
 ```
 
-Confirm explicitly, per change: the **new** net contains the pins it should, the **old** net no
-longer does, and no third net accidentally absorbed anything.
+Confirm per change: the **new** net contains the pins it should, the **old** net no longer does, and no
+third net absorbed anything.
 
-## 8. End-of-job checklist
+## 9. End-of-job checklist
 - [ ] Global **DRC** passes: no unconnected, no single-pin nets, no shorts.
-- [ ] Power rails that should be separate are still separate in the netlist.
-- [ ] Every "connect X to Y" landed (pin present in the target net) — re-checked from a fresh export.
+- [ ] Rails that should be separate are still separate in the netlist.
+- [ ] Every "connect X to Y" landed (pin present in the target net) — from a fresh export.
 - [ ] Any swapped part is wired by its **new** pin functions.
 - [ ] One final full-project netlist export, diffed against the baseline, reviewed end to end.
 </content>
