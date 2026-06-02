@@ -58,6 +58,19 @@ is an in-app JS Extension API reachable over a local WebSocket bridge). Prefer i
     listen on both `127.0.0.1` and `::1`. Verify with `curl` on `127.0.0.1`, `localhost`, and `[::1]`.
     After fixing the bridge, the extension must **re-attempt** once (re-open/re-run it, or restart the
     EDA) — it doesn't auto-rescan after giving up.
+  - ⚠️ **#1 connect blocker — extension settings:** in EasyEDA's **扩展管理器 (Extension Manager)** the
+    `run-api-gateway` extension must have **"允许外部交互" (Allow external interaction)** *and* **"显示在顶部菜单"
+    (Show in top menu)** checked. Without "allow external interaction" it **silently never connects** (no error
+    on the bridge — just `edaConnected:false` forever). It also does **not** auto-connect on EDA launch; once the
+    setting is on, run it from the top **API Gateway** menu.
+  - ⚠️ **Before SCH/netlist APIs work:** a **project must be open** and a **schematic document active** in the
+    editor, or calls return `null` / `"i is not iterable"`. `getAllProjectsUuid()` does **not** list local on-disk
+    projects (returns 0) — open the project from the start page first (computer-use double-click, or `openProject`).
+  - ⚠️ **`eda.sch_Netlist.getNetlist()` can exceed the bridge's 30 s request timeout** on a real multi-sheet board
+    (`REQUEST_TIMEOUT_MS` in bridge-server.mjs). Raising it requires restarting the bridge — which drops the EDA
+    connection (must re-open the extension after). For per-edit verification, prefer a **GUI netlist export (.tel)**
+    or targeted SCH reads over `getNetlist`. Net read/edit on the schematic is via the `SCH_*` primitive classes
+    (`getAllPrimitiveId({allSchematicPages:true})`, etc.), not a single netlist call.
 - **Third-party MCP servers** (stdio MCP → WebSocket gateway → in-app bridge extension):
   - [`hyl64/jlcmcp`](https://github.com/hyl64/jlcmcp) — ~39 tools incl. **read schematic, export
     netlist, schematic DRC**, component move/place, routing, copper, impedance calc.
