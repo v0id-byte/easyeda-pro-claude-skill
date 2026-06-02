@@ -49,6 +49,15 @@ is an in-app JS Extension API reachable over a local WebSocket bridge). Prefer i
   - [`easyeda/pro-api-sdk`](https://github.com/easyeda/pro-api-sdk) + docs at
     `prodocs.easyeda.com/en/api/` — the full Extension API surface (project, schematic, PCB,
     components, DRC, export).
+  - ⚠️ **macOS bridge gotcha (verified, fixable):** `easyeda-api-skill`'s bridge binds
+    **`127.0.0.1` (IPv4 only)** but the in-EDA extension dials `localhost`, which on macOS resolves
+    to **IPv6 `::1`** first — so the extension can't find the bridge ("未找到 Bridge 服务 / Bridge not
+    found", retries N/5 then gives up) even though `curl http://127.0.0.1:49620/health` works for you.
+    Fix `scripts/bridge-server.mjs`: bind **dual-stack** (`LISTEN_HOST = '::'`) **and reject
+    non-loopback peers** in the HTTP + WS handlers (so the code-exec endpoint stays local-only), or
+    listen on both `127.0.0.1` and `::1`. Verify with `curl` on `127.0.0.1`, `localhost`, and `[::1]`.
+    After fixing the bridge, the extension must **re-attempt** once (re-open/re-run it, or restart the
+    EDA) — it doesn't auto-rescan after giving up.
 - **Third-party MCP servers** (stdio MCP → WebSocket gateway → in-app bridge extension):
   - [`hyl64/jlcmcp`](https://github.com/hyl64/jlcmcp) — ~39 tools incl. **read schematic, export
     netlist, schematic DRC**, component move/place, routing, copper, impedance calc.
