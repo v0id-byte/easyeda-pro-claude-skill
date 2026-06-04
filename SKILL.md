@@ -1,7 +1,7 @@
 ---
 name: easyeda-pro
 description: Edit, fix, audit, or reverse-engineer schematics in EasyEDA Pro / LCEDA Pro / JLCEDA / 嘉立创EDA专业版 (立创EDA) — driving it through the official Extension API & WebSocket bridge, a third-party MCP server, or computer-use as a GUI fallback — and verifying every change against the exported netlist instead of the canvas. Use when the user wants to modify a schematic, fix circuit/connectivity defects, rename nets, connect floating/unconnected pins, add / move / delete / replace components, swap a chip part variant, wire SPI/power/ground, ground a thermal pad, or check a design's connectivity in EasyEDA Pro / LCEDA Pro / 嘉立创EDA / JLCEDA / EasyEDA. Encodes the netlist-first verification discipline (works no matter how you edit), the per-pin net-port connectivity model, the official API / MCP options (easyeda-api-skill, pro-api-sdk, jlcmcp, EasyEDA Pro MCP), the delete-no-connect-flag → place-net-port → draw-wire GUI workflow, Allegro .tel netlist export + grep/diff recipes, the .eprj2/.epro2 file formats, computer-use gotchas (stuck tools, occlusion freeze, 900s idle-timeout connector drops), and the "hand the user a precise change-list and verify via netlist" division of labor.
-version: 1.1.0
+version: 1.2.0
 ---
 
 # EasyEDA Pro / LCEDA Pro / 嘉立创EDA专业版 — schematic editing & netlist-verified fixes
@@ -87,6 +87,71 @@ a few edits.
 > Reality check: these channels let you *make* changes faster, but none of them *verify* connectivity
 > for you. Section 0 still applies. The unique value of this skill is the verification discipline +
 > mental model + fallback playbook below — it sits on top of whatever channel you use.
+
+## 1.5 Driving the official API directly — the recipes this skill was forged on
+
+When the bridge is up (§1) you edit via `eda.sch_*` JS classes over `curl /execute`. Mechanics, all
+**verified live on a real 5-sheet board**:
+
+**Reads — arrays in, plain values out.**
+- `eda.sch_PrimitiveComponent.get(id)` returns an **array**; the component is `[0]`. Its getters
+  (`designator`, `net`, `x`, `y`, `componentType`…) are live accessors that **don't survive
+  `JSON.stringify`** — extract the fields **inside** the executed code, return plain values.
+- `componentType` ∈ `"part"|"netport"|"netflag"`. **Net ports/flags are components** whose **`.net`** is
+  the net name and `.x/.y` the location — that's how you read connectivity.
+- `getAllPinsByPrimitiveId(id)` → `{pinNumber, pinName, x, y, noConnected}`. Pins **don't carry their
+  net** (the net is whatever port/wire sits at the pin's coordinate). `noConnected` is a **static
+  load-time attribute**, *not* live connectivity — it won't flip when you wire the pin.
+- `getAllPrimitiveId()` is scoped to the **active page only** (`{allSchematicPages:true}` → 0). To work
+  another page the **user switches the page tab** — there's no reliable API page-switch.
+
+**The verification oracle: a geometric netlister (because `getNetlist()` HANGS).**
+`eda.sch_Netlist.getNetlist()` **hangs forever** on a real board (pops a GUI dialog; never returns, not
+even at a raised 90 s bridge timeout). Build the netlist yourself:
+- `eda.sch_PrimitiveWire.getAll()` → each wire has **`.net`** (resolved name, may be `""`) and **`.line`**
+  = flat `[x1,y1,x2,y2,…]` polyline.
+- **Union-find over coincident coordinates**: union all vertices of each wire; a port at `(x,y)` and a pin
+  at `(x,y)` are the same node. Propagate **names** from ports (`.net`) + named wires. A pin's net = the
+  named net of its component. Reproduces `getNetlist` in ms — your per-edit check.
+- ⚠️ `wire.net` is a **stale cache** — after you add/remove a port it may not refresh until export. Trust
+  the **port** names + geometry; the GUI `.tel`/`.net` export re-resolves and is final ground truth.
+
+**Editing primitives:**
+- **`createNetPort(type, net, x, y, rotation, mirror)`** — `type` ∈ `"IN"|"OUT"|"BI"`. The port's
+  **connection pin lands exactly at `(x,y)` for any rotation** (calibrate: create one at a free spot, read
+  its pin back, delete). **To connect a pin, place a port at the pin's exact `(x,y)`** — coincidence =
+  connection, no wire needed.
+- ⚠️🔄 **Created net ports face INWARD → DRC fails → flip them 180°.** A fresh port's pentagon points
+  back at the pin/component; EasyEDA DRC flags it. The connection point is at the origin either way, so the
+  flip is DRC-cosmetic — but **the board won't pass DRC until each created port is rotated 180° to point
+  outward**. (Re-orienting a net port = delete + re-create with the flipped rotation — see below.)
+- **`modify(idOrObj, {x,y,rotation,designator,…})` works on PARTS ONLY** — it **throws on net ports**
+  ("仅当器件类型为元件时允许修改"). So **rename / re-orient / move a net port by delete + `createNetPort`**, never
+  modify. (modify negates y internally — `r=-r` — but that matches `create`'s `y:-this.y`, so passing only
+  `{designator}` keeps a part's position.)
+- **`delete([ids])`** on `sch_PrimitiveComponent` / `sch_PrimitiveWire`.
+
+**Delete / replace leave debris the NETLIST hides but DRC catches:**
+- ⚠️ **Deleting a net port leaves a stale zero-length stub wire** at its coord with the **old net name** →
+  coincides with your replacement → **phantom short** in the union-find. After every port rename, **delete
+  the leftover stub**.
+- ⚠️ **Deleting a *component* orphans its net-port labels + wires** (float in space, no pin under them).
+  The **netlist won't show them** (floating ports add no pins) — **DRC will** ("单网络 / floating port").
+  Sweep for ports whose node has no part pin (and wires touching none) and delete.
+- ⚠️ **Replacing a part with a different footprint disconnects EVERY pin** (SOT-23 → SO-8: all pin coords
+  move, old wires dangle). Re-wire **all** pins, and **tie every paralleled pin** (an SO-8 MOSFET has
+  3×Source + 4×Drain — all must reach the same net or they read floating). Name the previously-unnamed
+  local nodes (e.g. gate/drain) so you can attach the new pins by net name.
+
+**Bridge ops:** restarting the bridge is **safe** — the extension **auto-reconnects in ~18 s**, no user
+action (but raising `REQUEST_TIMEOUT_MS` won't rescue `getNetlist` — it hangs, not times-out).
+
+**Verify design intent against DATASHEETS, not just connectivity.** A perfectly-connected netlist can
+still be a **don't-fab** board. Pull the real datasheet for the critical ICs and check what the netlist
+can't see — e.g. TI **DRV8316C**: *"If the buck regulator is unused, SW_BK/GND_BK/FB_BK cannot be left
+floating or connected to ground"* (must add RBK/LBK + CBK); ams **AS5047P**: *"In 3.3V operation, VDD and
+VREG must be tied together"* (so VDD→5V **and** VDD3V3→3V3 is a wrong mix — LDO output fighting external
+3.3V). These are P0s a connectivity check sails right past.
 
 ## 2. Mental model: per-pin **net ports** define connectivity
 
@@ -203,6 +268,9 @@ Confirm per change: the **new** net contains the pins it should, the **old** net
 third net absorbed anything.
 
 ## 9. End-of-job checklist
+- [ ] Every net port you **created via the API is flipped 180° to face outward** (else DRC fails).
+- [ ] No **orphaned ports / dangling wires / stale stubs** left by deletes, port-renames, or part-replaces.
+- [ ] Critical ICs checked against their **datasheets** (unused-pin handling, supply modes) — not just connectivity.
 - [ ] Global **DRC** passes: no unconnected, no single-pin nets, no shorts.
 - [ ] Rails that should be separate are still separate in the netlist.
 - [ ] Every "connect X to Y" landed (pin present in the target net) — from a fresh export.
