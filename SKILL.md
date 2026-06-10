@@ -1,7 +1,7 @@
 ---
 name: easyeda-pro
-description: Edit, fix, audit, or reverse-engineer schematics in EasyEDA Pro / LCEDA Pro / JLCEDA / 嘉立创EDA专业版 (立创EDA) — driving it through the official Extension API & WebSocket bridge, a third-party MCP server, or computer-use as a GUI fallback — and verifying every change against the exported netlist instead of the canvas. Use when the user wants to modify a schematic, fix circuit/connectivity defects, rename nets, connect floating/unconnected pins, add / move / delete / replace components, swap a chip part variant, wire SPI/power/ground, ground a thermal pad, or check a design's connectivity in EasyEDA Pro / LCEDA Pro / 嘉立创EDA / JLCEDA / EasyEDA. Encodes the netlist-first verification discipline (works no matter how you edit), the per-pin net-port connectivity model, the official API / MCP options (easyeda-api-skill, pro-api-sdk, jlcmcp, EasyEDA Pro MCP), the delete-no-connect-flag → place-net-port → draw-wire GUI workflow, Allegro .tel netlist export + grep/diff recipes, the .eprj2/.epro2 file formats, computer-use gotchas (stuck tools, occlusion freeze, 900s idle-timeout connector drops), and the "hand the user a precise change-list and verify via netlist" division of labor.
-version: 1.2.0
+description: Edit, fix, audit, or reverse-engineer schematics in EasyEDA Pro / LCEDA Pro / JLCEDA / 嘉立创EDA专业版 (立创EDA) — driving it through the official Extension API & WebSocket bridge, a third-party MCP server, or computer-use as a GUI fallback — and verifying every change against the exported netlist instead of the canvas. Use when the user wants to modify a schematic, fix circuit/connectivity defects, rename nets, connect floating/unconnected pins, add / move / delete / replace components, swap a chip part variant, wire SPI/power/ground, ground a thermal pad, or check a design's connectivity in EasyEDA Pro / LCEDA Pro / 嘉立创EDA / JLCEDA / EasyEDA. Encodes the netlist-first verification discipline (works no matter how you edit), the per-pin net-port connectivity model, the official API / MCP options (easyeda-api-skill, pro-api-sdk, jlcmcp, EasyEDA Pro MCP), the delete-no-connect-flag → place-net-port → draw-wire GUI workflow, Allegro .tel netlist export + grep/diff recipes, the .eprj2/.epro2 file formats, computer-use gotchas (stuck tools, occlusion freeze, 900s idle-timeout connector drops), and the "hand the user a precise change-list and verify via netlist" division of labor. Also covers PCB autorouting & copper (§10): the native autorouter (布线→自动布线 with 忽略网络 + 移除) beats the Freerouting DSN→SES round-trip (which drops pours + the per-object clearance matrix and yields near-0 via gaps), copper-rebuild is GUI-only (铺铜管理器→重建所有), DRC rules read via API but write-via-API hangs (edit in the GUI 设计规则 dialog), the pcb_PrimitiveLine/Via/Pour/Component copper API + layer IDs, an API routing-quality audit (detour ratio), and save/tab-reopen context traps that can silently lose a whole route.
+version: 1.3.0
 ---
 
 # EasyEDA Pro / LCEDA Pro / 嘉立创EDA专业版 — schematic editing & netlist-verified fixes
@@ -276,4 +276,103 @@ third net absorbed anything.
 - [ ] Every "connect X to Y" landed (pin present in the target net) — from a fresh export.
 - [ ] Any swapped part is wired by its **new** pin functions.
 - [ ] One final full-project netlist export, diffed against the baseline, reviewed end to end.
+
+## 10. PCB autorouting, copper & the PCB API (hard-won on a dense 4-layer board)
+
+§0–9 are about **connectivity** (schematic). This section is the **PCB layout/routing** playbook —
+different APIs (`pcb_*`), different traps. Layout-time, the netlist is already fixed; here the oracle is
+the **DRC panel** + per-net geometry you read back over the API.
+
+### Decision: use the **native autorouter**, not Freerouting
+EasyEDA Pro's built-in autorouter (`布线 → 自动布线`) **respects the in-app DRC rules + copper pours
+natively** and gave a clean result (signals routed with ~2 spacing errors on a dense board where only
+Top+Bottom carry signal). **Freerouting via the DSN→jar→SES round-trip is a dead end for the *final*
+board** (below). Reach for the native router first; don't sink hours into Freerouting.
+
+### ⚠️ Why Freerouting round-trips fail here (so you can skip it)
+The toolchain *runs* but the output is unmanufacturable:
+- **Export DSN:** `eda.pcb_ManufactureData.getDsnFile(name)` → `File`; `await f.text()`.
+- **Pours export as `plane 0` (i.e. NOT exported)** → Freerouting is blind to your copper pours, so you
+  must **strip the poured nets from the DSN `(network)` AND `(class)` blocks** (paren-balanced delete) or
+  it routes GND/power as tracks fighting the pours.
+- **The per-object-type clearance matrix collapses** to one per-class clearance in the DSN (track-track
+  ~4mil exported; track-**via** 6mil / track-**copper** 10mil are LOST) → it packs tracks too tight.
+- **Run headless** (Java 25 runs the 2.2.4 jar): `java -Djava.awt.headless=true -jar
+  freerouting-2.2.4.jar -de in.dsn -do out.ses -mp 30 -da` (`-da` = no telemetry).
+- **Import SES:** `eda.pcb_Document.importAutoRouteSesFile(file)` — build the `File` from **base64**
+  inside the bridge eval. It **ADDS, doesn't replace** → delete existing tracks/vias first.
+- **The killer:** after import, track-to-via gaps land at **~0–4mil regardless of the DSN clearance**
+  (re-routing at 4→6mil gave *identical* violations — 107 on our board). It's an SES-import artifact,
+  not fixable from the DSN. Abandon → native router.
+
+### Native autorouter — the winning config (`布线 → 自动布线`)
+- **忽略网络 (ignore nets):** add every **poured** net (power, and GND if you pour/plane it) so the router
+  leaves them to the copper. (Dropdown adds one net per click then closes; the nets you want cluster at
+  the top of the list.)
+- **布线图层:** uncheck the inner layers (15/16) → route signals on **Top+Bottom only**, keep inner as
+  solid GND/power planes.
+- **已有导线/过孔:** **移除 (remove)** for a fresh full route. ⚠️ **保留 (keep) + 所有网络 re-processes
+  already-routed nets and spawns DUPLICATE vias** (drill-to-drill at 0mil — 114 of them once). For a fresh
+  route use **移除**; to add *only* a missing net, select it and use **所选网络**.
+- 45° corners, 完成度优先.
+
+### GND strategy trap
+**Ignoring GND** → GND pads not physically covered by a GND pour read as **connectivity opens** (62 on
+our board; the ratsnest shows far fewer — GND ratsnest is partly suppressed, so trust the DRC count, not
+飞线). Either **route GND too** (include it; costs some Top/Bottom congestion + a few tight via spots) or
+**stitch a via from each open GND pad down to the inner GND plane**.
+
+### Copper rebuild is **GUI-only** and mandatory after routing
+No API method exists. `工具 → 铺铜管理器 → 重建所有 → 确认`. **After ANY routing the pours are stale** and
+DRC reports spurious spacing errors until you rebuild. (The right-panel `重建铺铜区` button only rebuilds
+the *selected* pour.)
+
+### DRC rules: read via API, **write via GUI**
+- **Read:** `eda.pcb_Drc.getCurrentRuleConfiguration()` → `{config, name}`. Spacing matrix at
+  `config.Spacing["Safe Spacing"].copperThickness1oz.tables["1"].content` — per **object-type** (rows/cols
+  `[Track, SMD Pad, TH Pad, …, Via, Copper Zone, …]`; `content[5][0]` = Via-to-Track) **and** per **copper
+  weight** (`copperThickness1oz / 2oz / Inner0.5oz`).
+- ⚠️ **Write HANGS:** `overwriteCurrentRuleConfiguration()` (BETA) blocks forever and never applies. Edit
+  the matrix in the **GUI 设计规则 dialog** (gear ⚙ next to 网络间距规则, or 设计→设计规则): double-click the
+  cell → type → 确认.
+
+### ⚠️ Save / context traps (these cost us a full route — read this)
+- **Closing + reopening a PCB tab DESYNCS the bridge** — the API then reads `0 tracks` / a stale context
+  even though the board clearly displays routing. **Reconnect: `API Gateway → 重新连接`.**
+- **API `save()` can silently fail to persist** when the doc context is stale — we lost a complete route
+  because the on-disk file was an earlier pours-only state. **After routing: save with GUI `Cmd+S` AND
+  verify** by re-querying the track count over the API. Don't trust a bare `save() → true`.
+- A project often holds **several PCB copies** (`PCB1`, `PCB1_1`…); reopen the *right* one.
+- **Undo after a big autoroute is unreliable** (multi-step; over/under-shoots; desyncs API vs display).
+  Prefer **reload-from-saved** or a **fresh re-route** over deep undo chains.
+
+### PCB API quick reference (copper)
+- **Layer IDs:** Top=**1**, Bottom=**2**, Inner1=**15**, Inner2=**16** (silk 3/4, mask 5/6, outline 11,
+  multi 12, ratline 57). On PCB, `.get()` returns the object **directly** (not array-wrapped like SCH's
+  `[0]`). Resolve designator→id **fresh** — changing a primitive's layer gives it a NEW id.
+- `pcb_PrimitiveLine` (tracks): `get`→`{net, layer, startX, startY, endX, endY, lineWidth}`;
+  `create(net, layer, x1,y1,x2,y2, width)`.
+- `pcb_PrimitiveVia`: `get`→`{net, x, y, holeDiameter, diameter}`; `create(net,x,y,hole,dia,…)`.
+- `pcb_PrimitivePour`/`Fill`/`Region`: pour `get`→`{net, layer, pourName,
+  complexPolygon:{polygon:["R",x,y,w,h]}}` (pours are simple shapes — easy to read/emit).
+- `pcb_PrimitiveComponent`: `get`→`{designator, layer, x, y, otherProperty.Footprint}`;
+  `getAllPinsByPrimitiveId`→pads `{padNumber, net, x, y, layer, diameter, holeDiameter}`.
+- `pcb_Layer.getAllLayers()` / `getTheNumberOfCopperLayers()`; `pcb_Document`:
+  `importAutoRouteSesFile/importAutoRouteJsonFile/clearRouting/save/zoomToBoardOutline/navigateToRegion/getCalculatingRatlineStatus`.
+
+### Routing-quality audit via API (no screenshot needed)
+Grade trace lengths/paths objectively: per net, routed length = Σ `hypot(endX-startX, endY-startY)` over
+`PrimitiveLine` on copper layers; via count; pad span = max pairwise pad distance; **detour ratio =
+length / span**. 2-pad nets at ratio ~1.0–1.5 are direct; **>2 = convoluted** (this flagged the one
+badly-routed signal — a PWM net at 13 vias / 2.2×) — all without opening a screenshot. Lengths are mostly
+driven by component placement (far-apart pads), so judge *paths* by the ratio, not raw length.
+
+### PCB end-of-job checklist
+- [ ] Autoroute done with poured nets ignored, signals on Top+Bottom, inner left as planes.
+- [ ] **Copper rebuilt** (`铺铜管理器 → 重建所有`) after the last routing change, *then* DRC.
+- [ ] Power/three-phase widened or poured (≥40mil@1oz or copper); SW/charge-pump nets short & local.
+- [ ] GND pads all connected (route GND or stitch vias to the inner plane) — DRC connectivity = 0.
+- [ ] Teardrops (`工具 → 泪滴`) as the **last** step, after all tracks are final.
+- [ ] Antenna keep-out honored (no copper under a module's antenna).
+- [ ] **Saved via `Cmd+S` and verified persisted** (re-query track count), not just `save()→true`.
 </content>
